@@ -1,3 +1,11 @@
+// Polyfill fetch for Node environments without global fetch.
+// Keeps using dynamic import so it works in CommonJS on Render.
+if (typeof fetch === 'undefined') {
+  global.fetch = (...args) =>
+    import('node-fetch').then(({ default: fetch }) => fetch(...args));
+}
+
+
 require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
