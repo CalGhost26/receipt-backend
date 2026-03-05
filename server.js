@@ -1,8 +1,10 @@
-// Polyfill fetch for Node environments without global fetch.
-// Keeps using dynamic import so it works in CommonJS on Render.
-if (typeof fetch === 'undefined') {
-  global.fetch = (...args) =>
-    import('node-fetch').then(({ default: fetch }) => fetch(...args));
+// Polyfill fetch for Node environments that don't provide global fetch.
+// Use globalThis to avoid referencing `fetch` directly (prevents TDZ / ReferenceError).
+if (typeof globalThis.fetch === 'undefined') {
+  globalThis.fetch = async (...args) => {
+    const { default: fetch } = await import('node-fetch');
+    return fetch(...args);
+  };
 }
 
 
