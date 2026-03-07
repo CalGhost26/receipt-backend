@@ -1,11 +1,18 @@
-// Polyfill fetch for Node environments that don't provide global fetch.
-// Use globalThis to avoid referencing `fetch` directly (prevents TDZ / ReferenceError).
-if (typeof globalThis.fetch === 'undefined') {
-  globalThis.fetch = async (...args) => {
-    const { default: fetch } = await import('node-fetch');
-    return fetch(...args);
-  };
+// === fetch polyfill using undici (MUST be the very first lines) ===
+try {
+  if (typeof globalThis.fetch === 'undefined') {
+    // require() works in CommonJS; undici exports a fetch implementation
+    const { fetch } = require('undici');
+    globalThis.fetch = fetch;
+  }
+} catch (err) {
+  // If the polyfill fails for any reason, log it immediately so Render shows it
+  // and the deploy won't silently swallow the error.
+  // This helps diagnose install/runtime problems.
+  // Do NOT remove this console.error while debugging.
+  console.error('fetch polyfill (undici) error:', err);
 }
+// ================================================================
 
 
 require('dotenv').config();
