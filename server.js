@@ -163,6 +163,33 @@ app.post('/s3/presign', express.json(), async (req, res) => {
   }
 });
 
+
+// GET /s3/presign-get?key=<object-key>&expires=<seconds(optional)>
+app.get('/s3/presign-get', async (req, res) => {
+  try {
+    const key = req.query.key || req.query.Key;
+    const expires = Number(req.query.expires) || 60 * 10; // default 10 minutes
+    if (!key) return res.status(400).json({ error: 'missing_key' });
+
+    // ensure bucket env var
+    const bucket = process.env.S3_BUCKET;
+    if (!bucket) return res.status(500).json({ error: 's3_not_configured' });
+
+    const params = {
+      Bucket: bucket,
+      Key: key,
+      Expires: expires
+    };
+
+    // getSignedUrlPromise is available on AWS SDK v2 in Node
+    const url = await s3.getSignedUrlPromise('getObject', params);
+    return res.json({ url, expires });
+  } catch (err) {
+    console.error('presign-get error:', err);
+    return res.status(500).json({ error: 'presign_get_failed', message: String(err) });
+  }
+});
+
 // --------------------
 // Endpoint for Make -> Backend to POST parsed receipts
 // Make must attach X-Api-Key header equal to MAKE_TO_BACKEND_API_KEY env var.
