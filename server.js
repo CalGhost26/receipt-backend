@@ -1,7 +1,22 @@
 // server.js
-// ===== fetch polyfill (MUST be at very top, before any 'fetch' identifier is declared) =====
+// ==========
+// Requirements:
+// - environment variables:
+//   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+//   SUPABASE_URL, SUPABASE_SERVICE_KEY
+//   MAKE_TO_BACKEND_API_KEY
+//   PORT (optional)
+//
+// Notes:
+// - This file includes:
+//   * fetch polyfill (undici) for environments that lack fetch
+//   * express.json middleware (so /receipts/parsed accepts JSON from Make)
+//   * debug upload endpoint (/receipts/upload) using multer
+//   * parsed endpoint (/receipts/parsed) which inserts into Supabase
+//   * optional S3 presign endpoint (/s3/presign) for direct uploads from clients
+// - Adjust any table/column names to match your Supabase schema.
+
 try {
-  // if globalThis.fetch is missing or not a function, polyfill from undici
   if (typeof globalThis.fetch === 'undefined' || typeof globalThis.fetch !== 'function') {
     const undici = require('undici');
     if (undici && typeof undici.fetch === 'function') {
@@ -11,24 +26,27 @@ try {
     }
   }
 } catch (err) {
-  // If the polyfill fails, log the error so Render shows it in logs.
   console.error('fetch polyfill (undici) error:', err);
 }
-// (optional) quick confirmation in logs:
-// console.log('fetch available:', typeof globalThis.fetch === 'function' ? 'yes' : 'no');
-// ==========================================================================================
-
 
 require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
-const fs = require('fs');
+const fs = require('fs').promises;
+const path = require('path');
 const AWS = require('aws-sdk');
 const { createClient } = require('@supabase/supabase-js');
+const crypto = require('crypto');
+const cors = require('cors');
 
 const app = express();
 
-// init S3 (AWS SDK v2)
+// Basic middleware
+app.use(cors()); // allow all origins (you can lock this down in production)
+app.use(express.json({ limit: '10mb' })); // parse JSON bodies
+app.use(express.urlencoded({ extended: true, limit: '10mb' })); // parse urlencoded bodies
+
+// Init S3 (AWS SDK v2)
 const s3 = new AWS.S3({
   region: process.env.AWS_REGION,
   credentials: {
@@ -37,16 +55,19 @@ const s3 = new AWS.S3({
   }
 });
 
-// init Supabase (server-side service key)
+// Init Supabase (server-side service key)
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-// multer to store file to tmp
+// multer for file uploads (stores to /tmp)
 const upload = multer({ dest: '/tmp' });
 
 // health
 app.get('/_health', (req, res) => res.json({ ok: true }));
 
-// DEBUG upload endpoint - temporary. Paste over your current /receipts/upload handler.
+// --------------------
+// DEBUG upload endpoint (multipart/form-data)
+// Useful for testing file uploads from Bolt or Postman.
+// --------------------
 app.post('/receipts/upload', upload.single('receipt_image'), async (req, res) => {
   try {
     console.log('=== UPLOAD DEBUG START ===');
@@ -70,6 +91,23 @@ app.post('/receipts/upload', upload.single('receipt_image'), async (req, res) =>
     }
     console.log('req.body:', req.body);
 
+    // Optional: move file into S3 and return URL
+    let s3_url = null;
+    if (req.file && process.env.S3_BUCKET) {
+      const filePath = req.file.path;
+      const fileContents = await fs.readFile(filePath);
+      const key = `debug_uploads/${Date.now()}_${req.file.originalname}`;
+      await s3.putObject({
+        Bucket: process.env.S3_BUCKET,
+        Key: key,
+        Body: fileContents,
+        ContentType: req.file.mimetype
+      }).promise();
+      s3_url = `https://${process.env.S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+      // cleanup tmp file
+      await fs.unlink(filePath).catch(()=>{});
+    }
+
     return res.status(200).json({
       debug: true,
       received_body: req.body || null,
@@ -81,7 +119,8 @@ app.post('/receipts/upload', upload.single('receipt_image'), async (req, res) =>
         path: req.file.path || null,
         size: req.file.size || null
       } : null,
-      req_files_count: Array.isArray(req.files) ? req.files.length : null
+      req_files_count: Array.isArray(req.files) ? req.files.length : null,
+      s3_url
     });
   } catch (err) {
     console.error('upload debug error:', err);
@@ -89,36 +128,101 @@ app.post('/receipts/upload', upload.single('receipt_image'), async (req, res) =>
   }
 });
 
+// --------------------
+// Optional: generate presigned S3 upload URL for direct client uploads
+// Clients (Bolt) can POST to this endpoint to get a presigned PUT URL,
+// then upload directly to S3. This is recommended for larger files.
+// --------------------
+app.post('/s3/presign', express.json(), async (req, res) => {
+  try {
+    const { filename, contentType, user_id } = req.body || {};
+    if (!filename || !contentType) {
+      return res.status(400).json({ error: 'missing_params' });
+    }
+    if (!process.env.S3_BUCKET) {
+      return res.status(500).json({ error: 's3_not_configured' });
+    }
 
+    const unique = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    const key = `receipts/${user_id || 'anon'}/${unique}_${path.basename(filename)}`;
+    const params = {
+      Bucket: process.env.S3_BUCKET,
+      Key: key,
+      Expires: 60 * 10, // 10 minutes
+      ContentType: contentType,
+      ACL: 'private'
+    };
+
+    const url = await s3.getSignedUrlPromise('putObject', params);
+    const publicUrl = `https://${process.env.S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+
+    return res.json({ uploadUrl: url, key, publicUrl });
+  } catch (err) {
+    console.error('presign error:', err);
+    return res.status(500).json({ error: 'presign_failed', message: String(err) });
+  }
+});
+
+// --------------------
 // Endpoint for Make -> Backend to POST parsed receipts
 // Make must attach X-Api-Key header equal to MAKE_TO_BACKEND_API_KEY env var.
+// --------------------
 app.post('/receipts/parsed', async (req, res) => {
   try {
+    console.log('=== /receipts/parsed called ===');
+    console.log('headers:', req.headers);
+    // show a trimmed sample of the body for logs (avoid very large dumps)
+    try {
+      const bodySample = JSON.stringify(req.body);
+      console.log('body sample (first 4000 chars):', bodySample.slice(0, 4000));
+    } catch (e) {
+      console.log('failed to stringify body for logs', e);
+    }
+
+    // API key check
     const apiKey = req.header('X-Api-Key') || req.header('Authorization');
     if (!apiKey || apiKey !== process.env.MAKE_TO_BACKEND_API_KEY) {
+      console.warn('Unauthorized request to /receipts/parsed - missing or invalid API key');
       return res.status(401).json({ error: 'unauthorized' });
     }
 
     const payload = req.body;
     if (!payload || !payload.items || !Array.isArray(payload.items)) {
-      return res.status(400).json({ error: 'bad_payload' });
+      console.warn('Bad payload (missing items array)');
+      return res.status(400).json({ error: 'bad_payload', message: 'expected items array' });
     }
 
-    // Build receipt row
+    // Optional idempotency: if receipt_id provided, check whether it's already present
+    if (payload.receipt_id) {
+      const { data: existing, error: existingErr } = await supabase
+        .from('receipts')
+        .select('id, receipt_id')
+        .eq('receipt_id', payload.receipt_id)
+        .limit(1);
+
+      if (existingErr) {
+        console.error('Supabase check existing error:', existingErr);
+      } else if (existing && existing.length > 0) {
+        console.log('Duplicate receipt_id detected; returning OK without re-insert. receipt_id=', payload.receipt_id);
+        return res.status(200).json({ status: 'ok', info: 'duplicate_skipped' });
+      }
+    }
+
+    // Build receipt object matching your DB
     const receipt = {
       receipt_id: payload.receipt_id || null,
       user_id: payload.user_id || null,
       merchant: payload.merchant || null,
       date: payload.date || null,
-      subtotal: payload.subtotal || null,
-      tax: payload.tax || null,
-      total: payload.total || null,
+      subtotal: payload.subtotal ?? null,
+      tax: payload.tax ?? null,
+      total: payload.total ?? null,
       raw_text: payload.raw_text || null,
       image_url: payload.image_url || null,
       created_at: new Date().toISOString()
     };
 
-    // Insert receipt
+    // Insert receipt row
     const { data: receiptRow, error: receiptErr } = await supabase
       .from('receipts')
       .insert(receipt)
@@ -126,34 +230,37 @@ app.post('/receipts/parsed', async (req, res) => {
       .single();
 
     if (receiptErr) {
-      console.error('Supabase insert error:', receiptErr);
-      return res.status(500).json({ error: 'db_error' });
+      console.error('Supabase insert receipt error:', receiptErr);
+      return res.status(500).json({ error: 'db_error', details: receiptErr });
     }
 
-    // Prepare items and insert
+    // Prepare items to insert
     const itemsToInsert = payload.items.map(it => ({
       receipt_id: receiptRow.id,
-      name: it.name,
-      qty: it.qty ?? 1,
+      name: it.name || null,
+      qty: (it.qty !== undefined && it.qty !== null) ? it.qty : 1,
       unit: it.unit || null,
-      price: it.price ?? null,
+      price: (it.price !== undefined && it.price !== null) ? it.price : null,
       normalized_name: it.normalized_name || null
     }));
 
-    const { error: itemsErr } = await supabase
-      .from('receipt_items')
-      .insert(itemsToInsert);
+    if (itemsToInsert.length > 0) {
+      const { data: itemsData, error: itemsErr } = await supabase
+        .from('receipt_items')
+        .insert(itemsToInsert);
 
-    if (itemsErr) {
-      console.error('Supabase insert items error:', itemsErr);
-      // return 200 but indicate partial — choose behavior you prefer
-      return res.status(200).json({ status: 'partial', message: 'items_insert_failed' });
+      if (itemsErr) {
+        console.error('Supabase insert items error:', itemsErr);
+        // Decide behavior: here we return 200 with partial status so Make doesn't retry endlessly,
+        // but you can change to 500 if you prefer strict failure.
+        return res.status(200).json({ status: 'partial', message: 'items_insert_failed', details: itemsErr });
+      }
     }
 
-    return res.status(200).json({ status: 'ok' });
+    return res.status(200).json({ status: 'ok', receipt_id: receiptRow.id });
   } catch (err) {
     console.error('parsed handler error:', err);
-    return res.status(500).json({ error: 'internal_error' });
+    return res.status(500).json({ error: 'internal_error', message: String(err) });
   }
 });
 
