@@ -89,7 +89,6 @@ app.post('/receipts/upload', upload.single('receipt_image'), async (req, res) =>
   }
 });
 
-app.use(express.json());
 
 // Endpoint for Make -> Backend to POST parsed receipts
 // Make must attach X-Api-Key header equal to MAKE_TO_BACKEND_API_KEY env var.
