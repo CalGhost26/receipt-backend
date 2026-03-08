@@ -64,67 +64,130 @@ const upload = multer({ dest: '/tmp' });
 // health
 app.get('/_health', (req, res) => res.json({ ok: true }));
 
-// --------------------
-// DEBUG upload endpoint (multipart/form-data)
-// Useful for testing file uploads from Bolt or Postman.
-// --------------------
+// Replace your existing /receipts/upload handler with this block
 app.post('/receipts/upload', upload.single('receipt_image'), async (req, res) => {
   try {
-    console.log('=== UPLOAD DEBUG START ===');
-    console.log('headers:', req.headers ? Object.keys(req.headers) : '<no headers>');
-    console.log('body keys:', req.body ? Object.keys(req.body) : '<no body>');
-    console.log('req.file present?', Boolean(req.file));
-    if (req.file) {
-      console.log('req.file keys:', Object.keys(req.file));
-      console.log('req.file.originalname:', req.file.originalname);
-      console.log('req.file.mimetype:', req.file.mimetype);
-      console.log('req.file.path:', req.file.path || '<no path>');
-      console.log('req.file.size:', req.file.size || '<no size>');
-    }
-    console.log('req.files present?', Boolean(req.files));
-    if (Array.isArray(req.files)) {
-      console.log('req.files length:', req.files.length);
-      req.files.forEach((f, i) => {
-        console.log(`files[${i}] keys:`, Object.keys(f));
-        console.log(`files[${i}].originalname:`, f.originalname);
-      });
-    }
-    console.log('req.body:', req.body);
+    console.log('=== UPLOAD (full pipeline) START ===');
+    console.log('received file?', Boolean(req.file), 'body:', req.body ? Object.keys(req.body) : null);
 
-    // Optional: move file into S3 and return URL
-    let s3_url = null;
-    if (req.file && process.env.S3_BUCKET) {
+    if (!req.file) {
+      return res.status(400).json({ error: 'missing_file', message: 'expecting multipart form field "receipt_image"' });
+    }
+
+    // basic file metadata
+    const originalName = req.file.originalname || req.file.filename || 'receipt.jpg';
+    const contentType = req.file.mimetype || 'application/octet-stream';
+    const userId = req.body.user_id || null;
+    const receiptIdFromClient = req.body.receipt_id || null;
+
+    // If S3 configured -> upload
+    let s3Key = null;
+    let s3Url = null;
+    if (process.env.S3_BUCKET) {
       const filePath = req.file.path;
-      const fileContents = await fs.readFile(filePath);
-      const key = `debug_uploads/${Date.now()}_${req.file.originalname}`;
+      const fileContents = await fs.readFile(filePath); // read from /tmp
+      // create a deterministic key for receipts
+      const unique = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+      s3Key = `receipts/${userId || 'anon'}/${unique}_${path.basename(originalName)}`;
+
       await s3.putObject({
         Bucket: process.env.S3_BUCKET,
-        Key: key,
+        Key: s3Key,
         Body: fileContents,
-        ContentType: req.file.mimetype
+        ContentType: contentType,
+        ACL: 'private'
       }).promise();
-      s3_url = `https://${process.env.S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
-      // cleanup tmp file
+
+      // create short-lived presigned GET for OCR.space and later preview
+      s3Url = await s3.getSignedUrlPromise('getObject', {
+        Bucket: process.env.S3_BUCKET,
+        Key: s3Key,
+        Expires: 60 * 10 // 10 minutes
+      });
+
+      // cleanup local tmp file
       await fs.unlink(filePath).catch(()=>{});
+    } else {
+      // If no S3, we can still send OCR.space the raw file bytes via multipart (but we prefer S3)
+      console.warn('S3_BUCKET not configured: skipping S3 upload. Using a local file buffer for OCR (not persisted).');
     }
 
+    // Call OCR.space with the presigned GET URL if available; otherwise, call with raw text fallback
+    const ocrApiKey = process.env.OCR_SPACE_API_KEY;
+    let ocrParsedText = null;
+    let ocrRawResponse = null;
+
+    if (!ocrApiKey) {
+      console.warn('No OCR_SPACE_API_KEY set - skipping OCR step.');
+    } else {
+      try {
+        // If we have an s3Url, ask OCR.space to fetch it. This avoids needing multipart build tools.
+        if (s3Url) {
+          const params = new URLSearchParams();
+          params.append('url', s3Url);
+          params.append('language', 'eng');
+          // optional: params.append('OCREngine', '2');
+
+          const ocrResp = await fetch('https://api.ocr.space/parse/image', {
+            method: 'POST',
+            headers: {
+              'apikey': ocrApiKey,
+              'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            body: params.toString()
+          });
+
+          ocrRawResponse = await ocrResp.json().catch(()=>null);
+          if (ocrRawResponse && Array.isArray(ocrRawResponse.ParsedResults) && ocrRawResponse.ParsedResults[0]) {
+            ocrParsedText = ocrRawResponse.ParsedResults[0].ParsedText || null;
+          }
+        } else {
+          // If no S3, we can fall back to sending raw file bytes to OCR.space, but that requires building multipart.
+          // For simplicity we skip this path by default (you can extend later).
+          console.warn('No s3Url available to send to OCR.space. Skipping OCR.');
+        }
+      } catch (ocrErr) {
+        console.error('OCR.space call failed:', ocrErr);
+      }
+    }
+
+    // Insert a simple receipt row into Supabase (raw_text + image_url)
+    const receiptRow = {
+      receipt_id: receiptIdFromClient || null,
+      user_id: userId || null,
+      merchant: null,
+      date: null,
+      subtotal: null,
+      tax: null,
+      total: null,
+      raw_text: ocrParsedText || (ocrRawResponse ? JSON.stringify(ocrRawResponse).slice(0, 2000) : null),
+      image_url: s3Url || null,
+      created_at: new Date().toISOString()
+    };
+
+    const { data: insertedReceipt, error: insertErr } = await supabase
+      .from('receipts')
+      .insert(receiptRow)
+      .select()
+      .single();
+
+    if (insertErr) {
+      console.error('Supabase insert error:', insertErr);
+      return res.status(500).json({ error: 'db_error', details: insertErr });
+    }
+
+    // Return succinct response for Make
     return res.status(200).json({
-      debug: true,
-      received_body: req.body || null,
-      received_file_present: !!req.file || !!req.files,
-      req_file: req.file ? {
-        fieldname: req.file.fieldname,
-        originalname: req.file.originalname,
-        mimetype: req.file.mimetype,
-        path: req.file.path || null,
-        size: req.file.size || null
-      } : null,
-      req_files_count: Array.isArray(req.files) ? req.files.length : null,
-      s3_url
+      status: 'ok',
+      receipt_id: insertedReceipt.id,
+      s3_key: s3Key,
+      s3_url: s3Url,
+      raw_text: ocrParsedText,
+      ocr_raw: ocrRawResponse
     });
   } catch (err) {
-    console.error('upload debug error:', err);
-    return res.status(500).json({ error: 'internal_debug_error', message: String(err) });
+    console.error('upload pipeline error:', err);
+    return res.status(500).json({ error: 'internal_error', message: String(err) });
   }
 });
 
