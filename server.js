@@ -27,7 +27,6 @@ const AWS = require('aws-sdk');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(express.json());
 
 // init S3 (AWS SDK v2)
 const s3 = new AWS.S3({
@@ -89,6 +88,8 @@ app.post('/receipts/upload', upload.single('receipt_image'), async (req, res) =>
     return res.status(500).json({ error: 'internal_debug_error', message: String(err) });
   }
 });
+
+app.use(express.json());
 
 // Endpoint for Make -> Backend to POST parsed receipts
 // Make must attach X-Api-Key header equal to MAKE_TO_BACKEND_API_KEY env var.
